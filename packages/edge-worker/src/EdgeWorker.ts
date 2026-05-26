@@ -146,6 +146,12 @@ export class EdgeWorker extends EventEmitter {
 	private userAccessControl: UserAccessControl;
 	/** Tracks issues that completed plan-mode, for team re-evaluation on subsequent sessions */
 	private planCompletedIssues: Map<string, number> = new Map();
+	/**
+	 * Cache of Cyrus's own Linear user ID per repository (workspace).
+	 * Used to set `delegateId` on issues when a session starts (SAY-1361 telemetry).
+	 * Populated lazily on first use, then reused for the lifetime of the worker.
+	 */
+	private agentUserIdByRepo: Map<string, string> = new Map();
 
 	constructor(config: EdgeWorkerConfig) {
 		super();
@@ -1835,6 +1841,12 @@ export class EdgeWorker extends EventEmitter {
 
 		// Move issue to started state automatically, in case it's not already
 		await this.moveIssueToStartedState(fullIssue, repository.id);
+
+		// Ensure delegate=Cyrus is set on the issue for downstream telemetry (SAY-1361).
+		// Linear does not auto-populate this field for @mention or label-triggered sessions;
+		// without an explicit update, dashboards filtering by `delegate=Cyrus` miss
+		// every issue Cyrus actually handled.
+		await this.ensureIssueDelegateSet(fullIssue, repository.id);
 
 		// Create workspace using full issue data
 		// Use custom handler if provided, otherwise create a git worktree by default
@@ -4335,6 +4347,84 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 				error,
 			);
 			// Don't throw - we don't want to fail the entire assignment process due to state update failure
+		}
+	}
+
+	/**
+	 * Ensure the issue's `delegate` field points at Cyrus's own Linear agent user.
+	 *
+	 * Linear only auto-populates `delegate` when a user explicitly delegates an
+	 * issue from the UI. Sessions triggered by @mention, label routing, or
+	 * description tags leave `delegate` empty, which breaks any downstream
+	 * dashboard / analytics filtering by `delegate=Cyrus` (SAY-1361).
+	 *
+	 * This method:
+	 *   1. Resolves Cyrus's own user ID for the workspace (cached after first call).
+	 *   2. No-ops if `delegateId` is already set to the same user.
+	 *   3. Otherwise calls `updateIssue({ delegateId })`.
+	 *
+	 * Errors are swallowed (logged only) — telemetry must never break the
+	 * session-start flow.
+	 *
+	 * @param issue Full Linear issue object from Linear SDK
+	 * @param repositoryId Repository ID for issue tracker lookup
+	 */
+	private async ensureIssueDelegateSet(
+		issue: Issue,
+		repositoryId: string,
+	): Promise<void> {
+		try {
+			const issueTracker = this.issueTrackers.get(repositoryId);
+			if (!issueTracker) {
+				console.warn(
+					`[EdgeWorker] No issue tracker for repository ${repositoryId}, skipping delegate update`,
+				);
+				return;
+			}
+
+			// Resolve Cyrus's own user ID, caching per repository.
+			let agentUserId = this.agentUserIdByRepo.get(repositoryId);
+			if (!agentUserId) {
+				const viewer = await issueTracker.fetchCurrentUser();
+				if (!viewer?.id) {
+					console.warn(
+						`[EdgeWorker] Could not resolve current user for repository ${repositoryId}, skipping delegate update`,
+					);
+					return;
+				}
+				agentUserId = viewer.id;
+				this.agentUserIdByRepo.set(repositoryId, agentUserId);
+				console.log(
+					`[EdgeWorker] Resolved agent user ID for ${repositoryId}: ${agentUserId}`,
+				);
+			}
+
+			// Skip if already correctly set (avoids redundant API writes).
+			const currentDelegateId =
+				(issue as unknown as { delegateId?: string }).delegateId ?? undefined;
+			if (currentDelegateId === agentUserId) {
+				return;
+			}
+
+			if (!issue.id) {
+				console.warn(
+					`Issue ${issue.identifier} has no ID, skipping delegate update`,
+				);
+				return;
+			}
+
+			await issueTracker.updateIssue(issue.id, {
+				delegateId: agentUserId,
+			});
+			console.log(
+				`✅ Set delegate=Cyrus on issue ${issue.identifier} (${agentUserId})`,
+			);
+		} catch (error) {
+			// Never fail the session because of a telemetry update.
+			console.error(
+				`Failed to set delegate on issue ${issue.identifier}:`,
+				error,
+			);
 		}
 	}
 
